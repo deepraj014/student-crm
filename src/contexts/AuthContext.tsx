@@ -1,17 +1,29 @@
+// Replace your entire contexts/AuthContext.tsx with this:
+
 import type { User as FirebaseUser } from "firebase/auth";
 import {
   createUserWithEmailAndPassword,
   onAuthStateChanged,
   signInWithEmailAndPassword,
-  signInWithPopup,
   signOut,
   updateProfile,
 } from "firebase/auth";
-import { doc, getDoc, setDoc } from "firebase/firestore";
+import {
+  doc,
+  getDoc,
+  serverTimestamp,
+  setDoc,
+  updateDoc,
+} from "firebase/firestore";
 import type { ReactNode } from "react";
 import { createContext, useContext, useEffect, useState } from "react";
-import { auth, db, googleProvider } from "../config/firebase";
+import { auth, db } from "../config/firebase";
 import type { AuthContextType, User } from "../types/auth";
+import {
+  generateInvitationToken,
+  sendInvitationEmail,
+  validateInvitationToken,
+} from "../utils/invitations"; // Fixed import path (added 's')
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
 
@@ -31,8 +43,8 @@ export const AuthProvider = ({ children }: AuthProviderProps) => {
   const [currentUser, setCurrentUser] = useState<User | null>(null);
   const [loading, setLoading] = useState(true);
 
-  // Get or create user role in Firestore
-  const getUserRole = async (firebaseUser: FirebaseUser): Promise<User> => {
+  // Get user data from Firestore
+  const getUserData = async (firebaseUser: FirebaseUser): Promise<User> => {
     const userDoc = await getDoc(doc(db, "users", firebaseUser.uid));
 
     if (userDoc.exists()) {
@@ -40,64 +52,124 @@ export const AuthProvider = ({ children }: AuthProviderProps) => {
       return {
         uid: firebaseUser.uid,
         email: firebaseUser.email!,
-        displayName: firebaseUser.displayName || undefined,
+        displayName: firebaseUser.displayName || userData.displayName || "",
         role: userData.role,
+        status: userData.status,
+        createdAt: userData.createdAt?.toDate() || new Date(),
+        approvedAt: userData.approvedAt?.toDate(),
+        invitedBy: userData.invitedBy || "",
+        agentId: userData.agentId,
+        lastLoginAt: userData.lastLoginAt?.toDate(),
       };
     } else {
-      // New user, create with default role
-      const newUser: User = {
-        uid: firebaseUser.uid,
-        email: firebaseUser.email!,
-        displayName: firebaseUser.displayName || undefined,
-        role: "agent",
-      };
-
-      await setDoc(doc(db, "users", firebaseUser.uid), {
-        email: newUser.email,
-        displayName: newUser.displayName,
-        role: newUser.role,
-        createdAt: new Date(),
-      });
-
-      return newUser;
+      throw new Error("User data not found");
     }
   };
 
-  // Email/Password Login
+  // Regular login
   const login = async (email: string, password: string): Promise<void> => {
     await signInWithEmailAndPassword(auth, email, password);
+    // Update last login time
+    if (auth.currentUser) {
+      await updateDoc(doc(db, "users", auth.currentUser.uid), {
+        lastLoginAt: serverTimestamp(),
+      });
+    }
   };
 
-  // Email/Password Register
-  const register = async (
+  // Send invitation
+  const sendInvitation = async (
     email: string,
-    password: string,
-    displayName: string,
-    role: "agent" | "student"
+    role: "agent" | "student",
+    agentId?: string
   ): Promise<void> => {
+    if (!currentUser) throw new Error("Must be logged in to send invitations");
+
+    const token = generateInvitationToken();
+    const expiresAt = new Date();
+    expiresAt.setHours(expiresAt.getHours() + 48); // 48 hour expiry
+
+    const invitation: any = {
+      email,
+      role,
+      invitedBy: currentUser.uid,
+      invitedByName: currentUser.displayName,
+      expiresAt,
+      status: "pending",
+      createdAt: new Date(),
+      token, // Only one token field
+    };
+
+    // Only add agentId if it exists (for students)
+    if (role === "student" && (agentId || currentUser.role === "agent")) {
+      invitation.agentId = agentId || currentUser.uid;
+    }
+
+    try {
+      // Save invitation to Firestore
+      await setDoc(doc(db, "invitations", token), invitation);
+      console.log("Invitation saved successfully with token:", token);
+
+      // Send email (for now just log/alert)
+      sendInvitationEmail(email, token, role, currentUser.displayName);
+    } catch (error) {
+      console.error("Error saving invitation:", error);
+      throw error;
+    }
+  };
+
+  // Register with invitation token
+  const registerWithToken = async (
+    token: string,
+    password: string,
+    displayName: string
+  ): Promise<void> => {
+    // Validate token
+    const invitation = await validateInvitationToken(token);
+
+    // Create Firebase user
     const userCredential = await createUserWithEmailAndPassword(
       auth,
-      email,
+      invitation.email,
       password
     );
 
-    // Update the user's display name
-    if (displayName) {
-      await updateProfile(userCredential.user, { displayName });
-    }
+    // Update profile
+    await updateProfile(userCredential.user, { displayName });
 
     // Create user document in Firestore
-    await setDoc(doc(db, "users", userCredential.user.uid), {
-      email: userCredential.user.email,
+    const userData: any = {
+      email: invitation.email,
       displayName: displayName,
-      role: role,
-      createdAt: new Date(),
+      role: invitation.role,
+      status: invitation.role === "student" ? "active" : "pending", // Students auto-approved
+      createdAt: serverTimestamp(),
+      invitedBy: invitation.invitedBy,
+    };
+
+    // Only add agentId if it exists
+    if (invitation.agentId) {
+      userData.agentId = invitation.agentId;
+    }
+
+    await setDoc(doc(db, "users", userCredential.user.uid), userData);
+
+    // Mark invitation as accepted
+    await updateDoc(doc(db, "invitations", token), {
+      status: "accepted",
     });
   };
 
-  // Google Login
-  const loginWithGoogle = async (): Promise<void> => {
-    await signInWithPopup(auth, googleProvider);
+  // Approve user (admin only)
+  const approveUser = async (userId: string): Promise<void> => {
+    if (!currentUser || currentUser.role !== "admin") {
+      throw new Error("Only admins can approve users");
+    }
+
+    await updateDoc(doc(db, "users", userId), {
+      status: "active",
+      approvedAt: serverTimestamp(),
+    });
   };
 
   // Logout
@@ -111,10 +183,10 @@ export const AuthProvider = ({ children }: AuthProviderProps) => {
       async (firebaseUser: FirebaseUser | null) => {
         if (firebaseUser && firebaseUser.email) {
           try {
-            const user = await getUserRole(firebaseUser);
+            const user = await getUserData(firebaseUser);
             setCurrentUser(user);
           } catch (error) {
-            console.error("Error getting user role:", error);
+            console.error("Error getting user data:", error);
             setCurrentUser(null);
           }
         } else {
@@ -130,10 +202,11 @@ export const AuthProvider = ({ children }: AuthProviderProps) => {
   const value: AuthContextType = {
     currentUser,
     login,
-    register,
-    loginWithGoogle,
     logout,
     loading,
+    sendInvitation,
+    registerWithToken,
+    approveUser,
   };
 
   return (
